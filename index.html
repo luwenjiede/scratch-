@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Scratch 程序链查看器（优化版）</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="header-content">
+        <div class="title">Scratch 程序链查看器</div>
+        <div class="subtitle">上传 .sb3 文件解析角色、脚本与广播依赖关系</div>
+      </div>
+      <div class="toolbar">
+        <label class="file-label" for="file">
+          <span>选择文件</span>
+          <input id="file" class="input-file" type="file" accept=".sb3" />
+        </label>
+        <button id="reparse" class="btn alt">重新解析</button>
+        <button id="exportJson" class="btn">导出 JSON</button>
+        <div class="search-box" title="搜索脚本中的模块与参数">
+          <svg width="16" height="16" viewBox="0 0 24 24" style="opacity:.6;margin-right:6px"><path fill="currentColor" d="M9.5 3A6.5 6.5 0 1 1 3 9.5 6.508 6.508 0 0 1 9.5 3m0-2A8.5 8.5 0 1 0 18 9.5 8.51 8.51 0 0 0 9.5 1z"/><path fill="currentColor" d="M21 21l-4.35-4.35"/></svg>
+          <input id="searchInput" placeholder="搜索模块或参数" />
+        </div>
+        <div id="status" class="status">等待上传 .sb3</div>
+      </div>
+    </div>
+
+    <div class="app">
+      <div id="sidebar" class="sidebar">
+        <div class="section-title">舞台 / 背景</div>
+        <div id="stageList" class="list"></div>
+        <div class="section-title">角色</div>
+        <div id="spriteList" class="list"></div>
+      </div>
+
+      <div id="main" class="main">
+        <div id="detailTop" class="props" aria-live="polite"></div>
+        <div id="thumbs" class="thumbs"></div>
+        <div id="scriptsArea" class="scripts-area"></div>
+
+        <div id="broadcastPanel" class="broadcast-panel" style="display:none">
+          <div class="broadcast-title">广播依赖图</div>
+          <svg id="broadcastSvg" class="broadcast-svg" viewBox="0 0 800 240" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="legend">
+            <div style="display:flex;align-items:center;gap:6px"><div class="dot broadcast"></div>广播</div>
+            <div style="display:flex;align-items:center;gap:6px"><div class="dot sender"></div>发送者</div>
+            <div style="display:flex;align-items:center;gap:6px"><div class="dot receiver"></div>接收者</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <div id="lightbox-overlay" class="lightbox-overlay">
+    <div class="lightbox-card">
+      <img id="lightbox-img" src="" alt="preview"/>
+      <div class="lightbox-actions">
+        <a id="lightbox-download" class="btn alt" href="#" download>下载造型</a>
+        <button id="lightbox-close" class="btn">关闭</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(async function(){
+  // elements
+  const fileInput = document.getElementById('file');
+  const reparseBtn = document.getElementById('reparse');
+  const exportJsonBtn = document.getElementById('exportJson');
+  const status = document.getElementById('status');
+  const stageList = document.getElementById('stageList');
+  const spriteList = document.getElementById('spriteList');
+  const detailTop = document.getElementById('detailTop');
+  const scriptsArea = document.getElementById('scriptsArea');
+  const thumbs = document.getElementById('thumbs');
+  const broadcastPanel = document.getElementById('broadcastPanel');
+  const broadcastSvg = document.getElementById('broadcastSvg');
+  const searchInput = document.getElementById('searchInput');
+  const lightbox = document.getElementById('lightbox-overlay');
+  const lightboxImg = document.getElementById('lightbox-img');
+  const lightboxDownload = document.getElementById('lightbox-download');
+  const lightboxClose = document.getElementById('lightbox-close');
+
+  let OPCODE_MAP = {};
+  let SOURCES_MAP = {};
+  let createdBlobUrls = [];
+  let lastReport = null;
+
+  async function loadJsonSafe(path, fallback){
+    try{ const r = await fetch(path); if(!r.ok) throw new Error('fetch failed'); return await r.json(); }
+    catch(e){ console.warn('load failed', path, e); return fallback || {}; }
+  }
+
+  // load resources
+  OPCODE_MAP = await loadJsonSafe('opcode_map.json', {});
+  SOURCES_MAP = await loadJsonSafe('sources.json', {});
+
+  function human(op){ return OPCODE_MAP[op] || (op||'').replace(/_/g,' '); }
+
+  // helper: revoke blobs
+  function revokeCreatedBlobs(){ for(const u of createdBlobUrls){ try{ URL.revokeObjectURL(u); }catch(e){} } createdBlobUrls = []; }
+
+  // helper: find zip path for costume
+  function findZipFileForCostume(zip, costume){
+    const candidates = [];
+    if(costume.md5ext) candidates.push(costume.md5ext);
+    if(costume.md5) candidates.push(costume.md5);
+    if(costume.assetId) candidates.push(costume.assetId);
+    if(costume.name) candidates.push(costume.name);
+    for(const c of candidates){ if(!c) continue; if(zip.files[c]) return c; }
+    for(const path in zip.files){ for(const c of candidates){ if(!c) continue; if(path.indexOf(c) !== -1) return path; } }
+    return null;
+  }
+
+  // smarter resolution across all targets
+  function simpleResolve(token, targetName, assets){
+    if(!token) return '';
+    if(typeof token !== 'string') return String(token);
+    const m = token.match(/^(?:sound:|costume:)?(.+?)(?: \(from .*\))?$/);
+    const cand = m? m[1] : token;
+    // specific maps
+    const map = {'_mouse_':'鼠标','mouse-pointer':'鼠标指针','all':'全部'};
+    if(map[cand]) return map[cand];
+    // try target's assets first
+    if(assets && targetName && assets[targetName]){
+      const a = assets[targetName];
+      if(a.sounds[cand]) return a.sounds[cand];
+      if(a.costumes[cand]) return a.costumes[cand];
+    }
+    // try all targets
+    if(assets){
+      for(const tn in assets){
+        const a = assets[tn];
+        if(a.sounds[cand]) return `${a.sounds[cand]} (${tn})`;
+        if(a.costumes[cand]) return `${a.costumes[cand]} (${tn})`;
+      }
+    }
+    return cand;
+  }
+
+  function extractValue(input, blocks, targetName, assets){
+    if(!input) return '';
+    if(Array.isArray(input) && input.length >= 2){
+      const [_, val] = input;
+      if(typeof val === 'object' && val.id && blocks[val.id]){
+        return renderBlockHier(blocks, val.id, targetName, assets, 0, new Set())[0]?.text || '';
+      } else if(typeof val === 'string'){
+        return simpleResolve(val, targetName, assets);
+      } else if(typeof val === 'number'){
+        return String(val);
+      }
+    } else if(typeof input === 'object'){
+      if(input.id && blocks[input.id]){
+        return renderBlockHier(blocks, input.id, targetName, assets, 0, new Set())[0]?.text || '';
+      } else if('value' in input){
+        const val = input.value;
+        if(typeof val === 'number') return String(val);
+        else if(typeof val === 'boolean') return val ? '真' : '假';
+        else return String(val);
+      }
+    }
+    if(typeof input === 'string') return input;
+    return String(input);
+  }
+
+  function renderOperator(block, blocks, targetName, assets){
+    const op = block.opcode || '';
+    if(op === 'operator_random'){
+      const from = block.inputs && block.inputs.FROM? extractValue(block.inputs.FROM, blocks, targetName, assets) : (block.fields && block.fields.FROM? block.fields.FROM[0] : '');
+      const to = block.inputs && block.inputs.TO? extractValue(block.inputs.TO, blocks, targetName, assets) : (block.fields && block.fields.TO? block.fields.TO[0] : '');
+      return `在(${from})到(${to})之间产生随机数`;
+    }
+    const bin = {'operator_add':'+','operator_subtract':'-','operator_multiply':'*','operator_divide':'/','operator_mod':'%','operator_lt':'<','operator_gt':'>','operator_equals':'=='};
+    if(bin[op]){
+      const ins = Object.values(block.inputs || {});
+      const a = ins[0]? extractValue(ins[0], blocks, targetName, assets) : '';
+      const b = ins[1]? extractValue(ins[1], blocks, targetName, assets) : '';
+      return `(${a} ${bin[op]} ${b})`;
+    }
+    if(op === 'operator_not'){ const a = (Object.values(block.inputs||{})[0])? extractValue(Object.values(block.inputs||{})[0], blocks, targetName, assets) : ''; return `非(${a})`; }
+    return human(op);
+  }
+
+  function renderBlockHier(blocks, id, targetName, assets, indent=0, visited=new Set()){
+    if(!id || !blocks || !blocks[id]) return [];
+    if(visited.has(id)) return [{indent, text:`<循环引用 ${id}>`}];
+    visited.add(id);
+    const b = blocks[id]; const op = b.opcode || '<no-opcode>'; const opH = human(op);
+    const items = [];
+
+    // handle some well-known opcodes neatly
+    if(op === 'event_whenkeypressed'){
+      const key = b.fields && b.fields.KEY_OPTION? (Array.isArray(b.fields.KEY_OPTION)? b.fields.KEY_OPTION[0]: b.fields.KEY_OPTION) : '';
+      items.push({indent, text: `${opH}(${simpleResolve(key,targetName,assets)})键`});
+    } else if(op === 'sound_playuntildone' || op === 'sound_play'){
+      let name = '';
+      if(b.inputs && b.inputs.SOUND_MENU) name = extractValue(b.inputs.SOUND_MENU, blocks, targetName, assets);
+      else if(b.fields && b.fields.SOUND_MENU) name = Array.isArray(b.fields.SOUND_MENU)? b.fields.SOUND_MENU[0]: b.fields.SOUND_MENU;
+      items.push({indent, text: `${opH}(${simpleResolve(name,targetName,assets)})`});
+    } else if(op === 'motion_gotoxy'){
+      const x = b.inputs && b.inputs.X? extractValue(b.inputs.X, blocks, targetName, assets): (b.fields && b.fields.X? b.fields.X[0] : '');
+      const y = b.inputs && b.inputs.Y? extractValue(b.inputs.Y, blocks, targetName, assets): (b.fields && b.fields.Y? b.fields.Y[0] : '');
+      items.push({indent, text: `${opH}(${x}, ${y})`});
+    } else if(op === 'motion_pointindirection'){
+      let d = '';
+      if(b.inputs && b.inputs.DIRECTION) d = extractValue(b.inputs.DIRECTION, blocks, targetName, assets);
+      else if(b.fields && b.fields.DIRECTION) d = b.fields.DIRECTION[0];
+      items.push({indent, text: `${opH}(${d})方向`});
+    } else if(op === 'control_forever' || op === 'control_repeat'){
+      items.push({indent, text: `${opH}`});
+      let subId = null;
+      for(const k in b.inputs||{}){ if(k.toUpperCase().startsWith('SUBSTACK')){ const v=b.inputs[k]; if(Array.isArray(v)&&v.length>1) subId=v[1]; break; } }
+      if(subId && blocks[subId]){ let cur=subId; while(cur){ items.push(...renderBlockHier(blocks, cur, targetName, assets, indent+1, visited)); cur = blocks[cur] && blocks[cur].next; } }
+    } else if(op === 'control_if_else' || op === 'control_if'){
+      let cond = '';
+      if(b.inputs && b.inputs.CONDITION) cond = extractValue(b.inputs.CONDITION, blocks, targetName, assets);
+      items.push({indent, text: `${opH}(${cond})那么`});
+      if(b.inputs && b.inputs.SUBSTACK && Array.isArray(b.inputs.SUBSTACK) && b.inputs.SUBSTACK.length>1){ let cur=b.inputs.SUBSTACK[1]; while(cur){ items.push(...renderBlockHier(blocks, cur, targetName, assets, indent+1, visited)); cur = blocks[cur] && blocks[cur].next; } }
+      if(b.inputs && b.inputs.SUBSTACK2 && Array.isArray(b.inputs.SUBSTACK2) && b.inputs.SUBSTACK2.length>1){ items.push({indent, text:'否则'}); let cur=b.inputs.SUBSTACK2[1]; while(cur){ items.push(...renderBlockHier(blocks, cur, targetName, assets, indent+1, visited)); cur = blocks[cur] && blocks[cur].next; } }
+    } else if(op === 'control_stop'){
+      const opt = b.fields && b.fields.STOP_OPTION? (Array.isArray(b.fields.STOP_OPTION)? b.fields.STOP_OPTION[0]: b.fields.STOP_OPTION) : '';
+      if(opt === 'all' || opt === '全部') items.push({indent, text: '停止全部脚本'}); else items.push({indent, text: '停止'});
+    } else if(op && op.startsWith('operator_')){
+      items.push({indent, text: renderOperator(b, blocks, targetName, assets)});
+    } else {
+      const keys = ['STEPS','CHANGE','TO','BROADCAST_OPTION','KEY_OPTION','SECS','TIMES','VALUE','NAME','X','Y','DIRECTION'];
+      const params = [];
+      for(const k of keys){ if(b.inputs && b.inputs[k]) params.push(extractValue(b.inputs[k], blocks, targetName, assets)); else if(b.fields && b.fields[k]) params.push(Array.isArray(b.fields[k])? b.fields[k][0] : b.fields[k]); }
+      if(params.length){ const pstr = params.filter(x=>x!==undefined && x!=='').join(', '); items.push({indent, text: `${opH}(${pstr})`}); }
+      else {
+        let subId = null;
+        for(const k in b.inputs||{}){ if(k.toUpperCase().startsWith('SUBSTACK')){ const v=b.inputs[k]; if(Array.isArray(v)&&v.length>1) subId=v[1]; break; } }
+        if(subId && blocks[subId]){ items.push({indent, text: `${opH}`}); let cur=subId; while(cur){ items.push(...renderBlockHier(blocks, cur, targetName, assets, indent+1, visited)); cur = blocks[cur] && blocks[cur].next; } }
+        else items.push({indent, text: `${opH}`});
+      }
+    }
+    return items;
+  }
+
+  // parse sb3 and collect broadcasts
+  async function parseSb3ArrayBuffer(ab){
+    revokeCreatedBlobs();
+    status.textContent = '解析 .sb3 ...';
+    const zip = await JSZip.loadAsync(ab);
+    if(!zip.files['project.json']) throw new Error('project.json 未找到');
+    const txt = await zip.files['project.json'].async('string');
+    const project = JSON.parse(txt);
+
+    // build assets map
+    const assets = {};
+    for(const t of project.targets || []){
+      const name = t.name || '<unnamed>';
+      assets[name] = {sounds:{}, costumes:{}};
+      for(const s of t.sounds || []){
+        const key = s.md5ext || s.name;
+        assets[name].sounds[key] = s.name; assets[name].sounds[s.name] = s.name;
+      }
+      for(const c of t.costumes || []){
+        const key = c.md5ext || c.name;
+        assets[name].costumes[key] = c.name; assets[name].costumes[c.name] = c.name;
+      }
+    }
+
+    const broadcasts = {}; // name -> {senders:Set, receivers:Set}
+    function noteSend(bn, sender){ if(!bn) return; if(!broadcasts[bn]) broadcasts[bn] = {senders:new Set(), receivers:new Set()}; broadcasts[bn].senders.add(sender); }
+    function noteReceive(bn, receiver){ if(!bn) return; if(!broadcasts[bn]) broadcasts[bn] = {senders:new Set(), receivers:new Set()}; broadcasts[bn].receivers.add(receiver); }
+
+    const report = [];
+
+    for(const t of project.targets || []){
+      const name = t.name || '<unnamed>';
+      const blocks = t.blocks || {};
+
+      // find top-level blocks
+      const tops = [];
+      for(const id in blocks){ const b = blocks[id]; if(b.topLevel) tops.push(id); else if(!b.parent){ const op=b.opcode||''; if(op.startsWith('event_')||op.startsWith('when')||op.startsWith('control_when')||op.startsWith('procedures_')) tops.push(id); } }
+
+      // scan for broadcast send/receive
+      for(const id in blocks){ const b = blocks[id]; const op = b.opcode || '';
+        // receivers
+        if(op === 'event_whenbroadcastreceived' || op === 'event_whenbroadcastreceived_v2' || (op && op.includes('whenbroadcastreceived'))){
+          let bn = '';
+          if(b.fields && b.fields.BROADCAST_OPTION) bn = Array.isArray(b.fields.BROADCAST_OPTION)? b.fields.BROADCAST_OPTION[0] : b.fields.BROADCAST_OPTION;
+          else if(b.inputs && b.inputs.BROADCAST_OPTION) bn = extractValue(b.inputs.BROADCAST_OPTION, blocks, name, assets);
+          noteReceive(bn, name);
+        }
+        // senders — be conservative: only known broadcast opcodes
+        const knownBroadcastOps = ['event_broadcast','event_broadcastandwait','control_broadcast','control_broadcastandwait','broadcast_message'];
+        if(knownBroadcastOps.includes(op) || (op && op.toLowerCase().includes('broadcast') && (b.fields && b.fields.BROADCAST_OPTION || b.inputs && b.inputs.BROADCAST_OPTION))){
+          let bn = '';
+          if(b.fields && b.fields.BROADCAST_OPTION) bn = Array.isArray(b.fields.BROADCAST_OPTION)? b.fields.BROADCAST_OPTION[0] : b.fields.BROADCAST_OPTION;
+          else if(b.inputs && b.inputs.BROADCAST_OPTION) bn = extractValue(b.inputs.BROADCAST_OPTION, blocks, name, assets);
+          else {
+            const keys = Object.keys(b.fields||{}).concat(Object.keys(b.inputs||{}));
+            for(const k of keys){ if(k.toUpperCase().includes('BROADCAST')){ bn = b.fields && b.fields[k]? (Array.isArray(b.fields[k])? b.fields[k][0] : b.fields[k]) : (b.inputs && b.inputs[k]? extractValue(b.inputs[k], blocks, name, assets) : ''); break; } }
+          }
+          if(bn) noteSend(bn, name);
+        }
+      }
+
+      // build scripts
+      const scripts = [];
+      for(const topId of tops){ let cur = topId; const items = []; while(cur){ items.push(...renderBlockHier(blocks, cur, name, assets, 0, new Set())); cur = blocks[cur] && blocks[cur].next; } scripts.push({start: topId, items}); }
+
+      // costumes
+      const costumesInfo = [];
+      for(const c of t.costumes || []){
+        const path = findZipFileForCostume(zip, c);
+        if(path && zip.files[path]){
+          try{
+            if(/\.svg$/i.test(path)){
+              const svgText = await zip.files[path].async('string');
+              const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgText);
+              costumesInfo.push({name: c.name || path, md5ext: path, url, isSvg: true, svgText});
+            } else {
+              const blob = await zip.files[path].async('blob');
+              let finalBlob = blob;
+              if(!blob.type){ const ext = (path.split('.').pop() || '').toLowerCase(); const mimeMap = {png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', webp:'image/webp', gif:'image/gif'}; if(mimeMap[ext]) finalBlob = new Blob([blob], {type:mimeMap[ext]}); }
+              const url = URL.createObjectURL(finalBlob); createdBlobUrls.push(url);
+              costumesInfo.push({name: c.name || path, md5ext: path, url, isSvg: false});
+            }
+            continue;
+          }catch(e){ costumesInfo.push({name:c.name||path, md5ext:path, url:null, isSvg: /\.svg$/i.test(path)}); continue; }
+        } else { costumesInfo.push({name: c.name || (c.md5ext || c.md5 || c.assetId) || 'unknown', md5ext:null, url:null, isSvg:false}); }
+      }
+
+      // props
+      let currentIndex = null;
+      if(Array.isArray(t.costumes) && typeof t.currentCostume === 'number' && t.costumes[t.currentCostume]) currentIndex = t.currentCostume;
+      const isStage = !!t.isStage;
+      let currentCostumeName = null;
+      if(Array.isArray(t.costumes) && typeof t.currentCostume === 'number' && t.costumes[t.currentCostume]) currentCostumeName = t.costumes[t.currentCostume].name || t.costumes[t.currentCostume];
+      else if(t.currentCostume !== undefined) currentCostumeName = t.currentCostume;
+
+      const props = isStage ? {
+        isStage: true, currentBackdrop: currentCostumeName || null,
+        backdropCount: Array.isArray(t.costumes)? t.costumes.length : (t.costumes? Object.keys(t.costumes).length:0),
+        visible: t.visible!==undefined? t.visible : null,
+        costumesInfo
+      } : {
+        isStage: false,
+        x: (typeof t.x === 'number')? Math.round(t.x) : (t.x!==undefined? t.x : null),
+        y: (typeof t.y === 'number')? Math.round(t.y) : (t.y!==undefined? t.y : null),
+        direction: (typeof t.direction === 'number')? Math.round(t.direction) : (t.direction!==undefined? t.direction : null),
+        size: (typeof t.size === 'number')? Math.round(t.size) : (t.size!==undefined? t.size : null),
+        visible: t.visible!==undefined? t.visible : null,
+        currentCostume: currentCostumeName || null,
+        costumeCount: Array.isArray(t.costumes)? t.costumes.length : (t.costumes? Object.keys(t.costumes).length:0),
+        soundCount: Array.isArray(t.sounds)? t.sounds.length : (t.sounds? Object.keys(t.sounds).length:0),
+        costumesInfo,
+        currentCostumeIndex: currentIndex
+      };
+
+      report.push({name, props, scripts});
+    }
+
+    const broadcastReport = {};
+    for(const k in broadcasts){ broadcastReport[k] = { senders: Array.from(broadcasts[k].senders), receivers: Array.from(broadcasts[k].receivers) }; }
+
+    lastReport = report;
+    status.textContent = '解析完成';
+    renderSidebarAndSelectFirst(report);
+    renderBroadcastGraph(broadcastReport);
+    return {report, broadcastReport};
+  }
+
+  // UI builders
+  function buildTree(items){
+    const root = document.createElement('ul'); root.className = 'tree root';
+    const stacks = [root];
+    for(const it of items){
+      const depth = it.indent;
+      const text = it.text;
+      while(stacks.length <= depth){ const ul = document.createElement('ul'); ul.className = 'tree'; const parentLi = stacks[stacks.length-1].lastElementChild; if(parentLi) parentLi.appendChild(ul); else stacks[stacks.length-1].appendChild(ul); stacks.push(ul); }
+      while(stacks.length - 1 > depth) stacks.pop();
+      const li = document.createElement('li');
+      const bullet = document.createElement('span'); bullet.className = 'bullet';
+      const nodeWrap = document.createElement('span'); nodeWrap.style.display='inline-flex'; nodeWrap.style.alignItems='center';
+      const span = document.createElement('span'); span.className = 'node-text'; span.textContent = text;
+      span.dataset.nodeText = text.toLowerCase();
+      const caret = document.createElement('span'); caret.className = 'caret'; caret.innerHTML = '<svg viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"></path></svg>';
+      nodeWrap.appendChild(caret); nodeWrap.appendChild(span);
+      li.appendChild(bullet); li.appendChild(nodeWrap);
+      stacks[stacks.length-1].appendChild(li);
+    }
+    // caret behavior
+    const lis = root.querySelectorAll('li');
+    lis.forEach(li=>{
+      const childUl = li.querySelector(':scope > ul');
+      const caret = li.querySelector(':scope > span > .caret');
+      const span = li.querySelector(':scope > span > .node-text');
+      if(childUl && caret){
+        caret.addEventListener('click', (e)=>{ e.stopPropagation(); li.classList.toggle('node-collapsed'); });
+        span.addEventListener('click', (e)=>{ e.stopPropagation(); li.classList.toggle('node-collapsed'); });
+      } else { if(caret) caret.style.visibility='hidden'; }
+    });
+    return root;
+  }
+
+  function renderSidebarAndSelectFirst(report){
+    stageList.innerHTML = ''; spriteList.innerHTML = '';
+    const stages = report.filter(r => r.props && r.props.isStage);
+    const sprites = report.filter(r => !r.props || !r.props.isStage);
+    for(const r of stages) stageList.appendChild(createSidebarItem(r));
+    for(const r of sprites) spriteList.appendChild(createSidebarItem(r));
+    const first = spriteList.firstChild || stageList.firstChild;
+    if(first) first.click();
+  }
+
+  function createSidebarItem(r){
+    const el = document.createElement('div'); el.className = 'item';
+    const av = document.createElement('div'); av.className = 'avatar';
+    const info = r.props && r.props.costumesInfo && r.props.costumesInfo.length? (typeof r.props.currentCostumeIndex === 'number' ? (r.props.costumesInfo[r.props.currentCostumeIndex] || r.props.costumesInfo[0]) : r.props.costumesInfo[0]) : null;
+    if(info && info.url){ const img = document.createElement('img'); img.src = info.url; av.appendChild(img); } else { av.textContent = (r.name||'?').slice(0,2).toUpperCase(); }
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const name = document.createElement('div'); name.className = 'name'; name.textContent = r.name;
+    const sub = document.createElement('div'); sub.className = 'sub';
+    if(r.props && r.props.isStage) sub.textContent = `背景 · ${r.props.backdropCount} 个`;
+    else sub.textContent = `角色 · 造型 ${r.props.costumeCount || 0} · 声音 ${r.props.soundCount || 0}`;
+    meta.appendChild(name); meta.appendChild(sub);
+    el.appendChild(av); el.appendChild(meta);
+    el.addEventListener('click', ()=>{ 
+      document.querySelectorAll('.item.active').forEach(x=>x.classList.remove('active')); 
+      el.classList.add('active'); 
+      showDetailFor(r); 
+    });
+    return el;
+  }
+
+  function showDetailFor(r){
+    detailTop.innerHTML = ''; thumbs.innerHTML = ''; scriptsArea.innerHTML = '';
+    const props = r.props || {};
+    if(props.isStage){ detailTop.innerHTML = `<div class="prop">当前背景: <strong>${props.currentBackdrop || '-'}</strong></div><div class="prop">背景数: <strong>${props.backdropCount}</strong></div><div class="prop">可见: <strong>${props.visible}</strong></div>`; }
+    else { detailTop.innerHTML = `<div class="prop">位置: <strong>(${props.x}, ${props.y})</strong></div><div class="prop">方向: <strong>${props.direction}</strong></div><div class="prop">大小: <strong>${props.size}%</strong></div><div class="prop">当前造型: <strong>${props.currentCostume || '-'}</strong></div><div class="prop">造型数: <strong>${props.costumeCount}</strong></div><div class="prop">声音数: <strong>${props.soundCount}</strong></div>`; }
+
+    // thumbnails with lightbox
+    const costumes = props.costumesInfo || [];
+    costumes.forEach((c, idx) => {
+      const d = document.createElement('div'); d.className = 'thumb';
+      if(c.url){ const img = document.createElement('img'); img.src = c.url; d.appendChild(img);
+        d.addEventListener('click', ()=>{
+          lightboxImg.src = c.url; lightbox.style.display = 'flex';
+          if(c.isSvg && c.svgText){ lightboxDownload.dataset.svgText = c.svgText; lightboxDownload.dataset.filename = `${(r.name||'costume')}_${idx}.svg`; lightboxDownload.href = '#'; }
+          else { lightboxDownload.dataset.svgText = ''; lightboxDownload.dataset.filename = `${(r.name||'costume')}_${idx}.${(c.md5ext || 'png').split('.').pop()}`; lightboxDownload.href = c.url; }
+        });
+      } else { d.textContent = c.name || '-'; }
+      thumbs.appendChild(d);
+    });
+
+    // scripts
+    if(!r.scripts || r.scripts.length===0){ const nos = document.createElement('div'); nos.className='no-scripts'; nos.textContent='（无明显顶层脚本）'; scriptsArea.appendChild(nos); return; }
+    const row = document.createElement('div'); row.className = 'scripts-row';
+    r.scripts.forEach((s, idx) => {
+      const card = document.createElement('div'); card.className = 'script-card';
+      const meta = document.createElement('div'); meta.className = 'script-meta'; meta.textContent = `脚本${idx+1}（${s.items.length}个模块）`;
+      const treeContainer = document.createElement('div'); treeContainer.className = 'script-body';
+      const tree = buildTree(s.items);
+      treeContainer.appendChild(tree);
+      card.appendChild(meta); card.appendChild(treeContainer); row.appendChild(card);
+    });
+    scriptsArea.appendChild(row);
+    window.scrollTo({top:0, behavior:'smooth'});
+  }
+
+  // search
+  function searchAndHighlight(q){
+    const query = (q || '').trim().toLowerCase();
+    document.querySelectorAll('.node-text.highlight').forEach(n=>n.classList.remove('highlight'));
+    const allNodeText = Array.from(document.querySelectorAll('.node-text'));
+    if(!query) return [];
+    const matches = [];
+    allNodeText.forEach(nt=>{ const txt = (nt.dataset.nodeText || nt.textContent || '').toLowerCase(); if(txt.indexOf(query) !== -1){ nt.classList.add('highlight'); matches.push(nt); let par = nt.closest('li'); while(par){ par.classList.remove('node-collapsed'); par = par.parentElement && par.parentElement.closest('li'); } } });
+    return matches;
+  }
+
+  function jumpToNode(node){ if(!node) return; node.scrollIntoView({behavior:'smooth', block:'center'}); node.classList.add('highlight'); setTimeout(()=>node.classList.remove('highlight'), 1800); }
+
+  // broadcast visualization
+  function renderBroadcastGraph(broadcastReport){
+    const keys = Object.keys(broadcastReport);
+    if(keys.length === 0){ broadcastPanel.style.display = 'none'; return; }
+    broadcastPanel.style.display = 'block';
+    const w = 800, h = 240; const svg = broadcastSvg; svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    const broadcasts = keys;
+    const sendersSet = new Set(); const receiversSet = new Set();
+    broadcasts.forEach(b=>{ (broadcastReport[b].senders||[]).forEach(s=>sendersSet.add(s)); (broadcastReport[b].receivers||[]).forEach(r=>receiversSet.add(r)); });
+    const senders = Array.from(sendersSet); const receivers = Array.from(receiversSet);
+    const colLeftX = 80, colMidX = w/2, colRightX = w - 120; const gapY = 28; const senderYStart = 30, receiverYStart = 30, broadcastYStart = 30;
+
+    const senderMap = {}; const receiverMap = {}; const broadcastMap = {};
+    senders.forEach((s,i)=> senderMap[s] = {x: colLeftX, y: senderYStart + i*gapY});
+    receivers.forEach((r,i)=> receiverMap[r] = {x: colRightX, y: receiverYStart + i*gapY});
+    broadcasts.forEach((b,i)=> broadcastMap[b] = {x: colMidX, y: broadcastYStart + i*gapY*1.2});
+
+    // edges
+    broadcasts.forEach(b=>{ const br = broadcastReport[b]; const bpos = broadcastMap[b]; (br.senders||[]).forEach(s=>{ const spos = senderMap[s]; if(!spos) return; const line = document.createElementNS('http://www.w3.org/2000/svg','line'); line.setAttribute('x1', spos.x + 40); line.setAttribute('y1', spos.y + 8); line.setAttribute('x2', bpos.x - 40); line.setAttribute('y2', bpos.y + 8); line.setAttribute('stroke', '#10b981'); line.setAttribute('stroke-width', 2); line.setAttribute('opacity', 0.8); svg.appendChild(line); }); });
+    broadcasts.forEach(b=>{ const br = broadcastReport[b]; const bpos = broadcastMap[b]; (br.receivers||[]).forEach(r=>{ const rpos = receiverMap[r]; if(!rpos) return; const line = document.createElementNS('http://www.w3.org/2000/svg','line'); line.setAttribute('x1', bpos.x + 40); line.setAttribute('y1', bpos.y + 8); line.setAttribute('x2', rpos.x - 40); line.setAttribute('y2', rpos.y + 8); line.setAttribute('stroke', '#f97316'); line.setAttribute('stroke-width', 2); line.setAttribute('opacity', 0.8); svg.appendChild(line); }); });
+
+    // nodes
+    senders.forEach(s=>{ const pos = senderMap[s]; const g = document.createElementNS('http://www.w3.org/2000/svg','g'); const rect = document.createElementNS('http://www.w3.org/2000/svg','rect'); rect.setAttribute('x', pos.x - 8); rect.setAttribute('y', pos.y - 6); rect.setAttribute('rx',6); rect.setAttribute('ry',6); rect.setAttribute('width', 140); rect.setAttribute('height', 20); rect.setAttribute('fill','#ecfdf5'); rect.setAttribute('stroke','#10b981'); rect.setAttribute('stroke-width',1); const text = document.createElementNS('http://www.w3.org/2000/svg','text'); text.setAttribute('x', pos.x + 8); text.setAttribute('y', pos.y + 10); text.setAttribute('fill','#065f46'); text.setAttribute('font-size',12); text.textContent = s; g.appendChild(rect); g.appendChild(text); svg.appendChild(g); });
+    broadcasts.forEach(b=>{ const pos = broadcastMap[b]; const g = document.createElementNS('http://www.w3.org/2000/svg','g'); const circle = document.createElementNS('http://www.w3.org/2000/svg','circle'); circle.setAttribute('cx', pos.x); circle.setAttribute('cy', pos.y + 8); circle.setAttribute('r', 12); circle.setAttribute('fill','#eef2ff'); circle.setAttribute('stroke', '#2563eb'); circle.setAttribute('stroke-width',1.5); const text = document.createElementNS('http://www.w3.org/2000/svg','text'); text.setAttribute('x', pos.x + 20); text.setAttribute('y', pos.y + 10); text.setAttribute('fill','#0f172a'); text.setAttribute('font-size',12); text.textContent = b; g.appendChild(circle); g.appendChild(text); svg.appendChild(g); });
+    receivers.forEach(r=>{ const pos = receiverMap[r]; const g = document.createElementNS('http://www.w3.org/2000/svg','g'); const rect = document.createElementNS('http://www.w3.org/2000/svg','rect'); rect.setAttribute('x', pos.x - 132); rect.setAttribute('y', pos.y - 6); rect.setAttribute('rx',6); rect.setAttribute('ry',6); rect.setAttribute('width', 140); rect.setAttribute('height', 20); rect.setAttribute('fill','#fff7ed'); rect.setAttribute('stroke','#fb923c'); rect.setAttribute('stroke-width',1); const text = document.createElementNS('http://www.w3.org/2000/svg','text'); text.setAttribute('x', pos.x - 120); text.setAttribute('y', pos.y + 10); text.setAttribute('fill','#7c2d12'); text.setAttribute('font-size',12); text.textContent = r; g.appendChild(rect); g.appendChild(text); svg.appendChild(g); });
+  }
+
+  // lightbox download handler — support svg text dataset
+  lightboxDownload.addEventListener('click', (e)=>{
+    const svgText = lightboxDownload.dataset.svgText;
+    const filename = lightboxDownload.dataset.filename || 'costume.svg';
+    if(svgText){
+      e.preventDefault();
+      const blob = new Blob([svgText], {type:'image/svg+xml'});
+      const url = URL.createObjectURL(blob);
+      createdBlobUrls.push(url);
+      const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>{ try{ URL.revokeObjectURL(url); }catch(e){} }, 2000);
+    }
+  });
+
+  lightboxClose.addEventListener('click', ()=>{ lightbox.style.display = 'none'; lightboxImg.src = ''; lightboxDownload.href = '#'; lightboxDownload.dataset.svgText = ''; });
+
+  // file input
+  fileInput.addEventListener('change', async (e)=>{ if(!e.target.files || e.target.files.length===0) return; const f = e.target.files[0]; const ab = await f.arrayBuffer(); try{ await parseSb3ArrayBuffer(ab); }catch(err){ console.error(err); status.textContent = '解析失败: ' + (err.message || err); } });
+
+  reparseBtn.addEventListener('click', async ()=>{ const el = fileInput; if(!el.files || el.files.length===0){ status.textContent = '请先选择一个 .sb3 文件'; return; } const f = el.files[0]; const ab = await f.arrayBuffer(); try{ await parseSb3ArrayBuffer(ab); }catch(err){ console.error(err); status.textContent = '解析失败: ' + (err.message || err); } });
+
+  exportJsonBtn.addEventListener('click', ()=>{ if(!lastReport){ status.textContent = '无可导出的数据'; return; } const blob = new Blob([JSON.stringify(lastReport, null, 2)], {type:'application/json'}); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'scratch_report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>{ try{ URL.revokeObjectURL(url); }catch(e){} }, 2000); });
+
+  // search interactions
+  searchInput.addEventListener('input', (e)=>{ const q = e.target.value; searchAndHighlight(q); });
+  searchInput.addEventListener('keydown', (e)=>{ if(e.key === 'Enter'){ const matches = searchAndHighlight(e.target.value); if(matches && matches.length) jumpToNode(matches[0]); } });
+
+  // expose a simple drop area (optional)
+  document.addEventListener('dragover', (ev)=>{ ev.preventDefault(); });
+  document.addEventListener('drop', async (ev)=>{ ev.preventDefault(); if(!ev.dataTransfer) return; const f = ev.dataTransfer.files && ev.dataTransfer.files[0]; if(!f) return; if(!f.name.endsWith('.sb3')){ status.textContent = '请拖入 .sb3 文件'; return; } fileInput.files = ev.dataTransfer.files; const ab = await f.arrayBuffer(); try{ await parseSb3ArrayBuffer(ab); }catch(err){ console.error(err); status.textContent = '解析失败: ' + (err.message || err); } });
+
+  // done
+  status.textContent = '就绪（可上传 .sb3）';
+
+})();
+</script>
+</body>
+</html>
